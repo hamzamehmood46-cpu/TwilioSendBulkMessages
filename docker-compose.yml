@@ -1,0 +1,22 @@
+services:
+  backend:
+    build: .
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    env_file: twilio.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./contacts.json:/app/contacts.json
+    restart: unless-stopped
+
+  frontend:
+    build: .
+    command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+    env_file: twilio.env
+    environment:
+      - API_BASE_URL=http://backend:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
+    restart: unless-stopped

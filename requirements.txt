@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+twilio
+python-dotenv
+streamlit
+requests
+pyotp
+qrcode[pil]
+pandas
+openpyxl

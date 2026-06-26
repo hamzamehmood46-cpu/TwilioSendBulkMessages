@@ -1,0 +1,8 @@
+.venv
+__pycache__
+*.pyc
+.git
+.gitignore
+twilio.env
+totp_qr.png
+contacts.json

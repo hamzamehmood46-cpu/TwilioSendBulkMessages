@@ -1,0 +1,10 @@
+{
+  "groups": {
+    "IT Department": [
+      { "name": "Jane Doe", "phone": "+15551234567", "email": "jane@example.com" },
+      { "name": "John Smith", "phone": "+15551112222", "email": "" }
+    ],
+    "Helpdesk": [],
+    "Leadership": []
+  }
+}
