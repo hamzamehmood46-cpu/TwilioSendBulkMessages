@@ -1,12 +1,32 @@
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
   backend:
     build: .
     command: uvicorn main:app --host 0.0.0.0 --port 8000
     env_file: twilio.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
     ports:
       - "8000:8000"
     volumes:
       - ./contacts.json:/app/contacts.json
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: celery -A celery_app worker --loglevel=info
+    env_file: twilio.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
     restart: unless-stopped
 
   frontend:
@@ -15,6 +35,7 @@ services:
     env_file: twilio.env
     environment:
       - API_BASE_URL=http://backend:8000
+      - REDIS_URL=redis://redis:6379/0
     ports:
       - "8501:8501"
     depends_on:

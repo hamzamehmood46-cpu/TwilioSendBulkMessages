@@ -275,6 +275,13 @@ def refresh_contacts():
     fetch_contacts.clear()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_phone_numbers():
+    resp = requests.get(f"{API_BASE_URL}/api/phone-numbers", timeout=5)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def filter_groups(all_groups: dict, query: str) -> dict:
     query = query.strip().lower()
     if not query:
@@ -298,6 +305,13 @@ try:
 except requests.RequestException as err:
     groups = {}
     contacts_error = str(err)
+
+try:
+    phone_numbers = fetch_phone_numbers()
+    phone_numbers_error = None
+except requests.RequestException as err:
+    phone_numbers = []
+    phone_numbers_error = str(err)
 
 with st.sidebar:
     st.divider()
@@ -364,6 +378,17 @@ with tab_send:
     with col_compose:
         with st.container(border=True):
             st.markdown("### Compose")
+
+            from_number = None
+            if phone_numbers_error:
+                st.error(f"Could not load Twilio numbers: {phone_numbers_error}")
+            elif not phone_numbers:
+                st.warning("No Twilio numbers found on this account.")
+            else:
+                number_options = [f"{n['friendlyName']} ({n['phoneNumber']})" for n in phone_numbers]
+                selected_label = st.selectbox("Send from", options=number_options, key="from_number_select")
+                from_number = phone_numbers[number_options.index(selected_label)]["phoneNumber"]
+
             message = st.text_area("Message", max_chars=480, height=130, label_visibility="collapsed", placeholder="Type your message...")
             count_color = "#dc2626" if len(message) > 420 else "#8a8f98"
             st.markdown(f"<span style='color:{count_color};font-size:0.8rem'>{len(message)} / 480</span>", unsafe_allow_html=True)
@@ -379,33 +404,64 @@ with tab_send:
             send_clicked = st.button("Send Message", type="primary", use_container_width=True)
 
         if send_clicked:
-            if not message.strip():
+            if not from_number:
+                st.error("No sender number available — check your Twilio account.")
+            elif not message.strip():
                 st.error("Please enter a message.")
             elif not selected_recipients:
                 st.error("Please select at least one recipient.")
             else:
-                with st.spinner("Sending..."):
+                with st.spinner("Queuing..."):
                     try:
                         resp = requests.post(
                             f"{API_BASE_URL}/api/send",
-                            json={"message": message, "recipients": selected_recipients},
+                            json={"message": message, "fromNumber": from_number, "recipients": selected_recipients},
                             headers=auth_headers(),
                             timeout=30,
                         )
                         data = resp.json()
                     except requests.RequestException as err:
                         st.error(f"Request failed: {err}")
+                        data = None
+
+                if data is not None:
+                    if handle_unauthorized(resp):
+                        st.error("Session expired. Please log in again.")
+                        st.rerun()
+                    elif resp.status_code != 200:
+                        st.error(data.get("detail", "Send failed"))
                     else:
-                        if handle_unauthorized(resp):
-                            st.error("Session expired. Please log in again.")
-                            st.rerun()
-                        elif resp.status_code != 200:
-                            st.error(data.get("detail", "Send failed"))
-                        else:
-                            st.success(f"Message sent to {data['sentCount']} recipient(s).")
-                            failed_count = data["total"] - data["sentCount"]
+                        # The backend just enqueues the batch on a Celery worker and
+                        # returns immediately; poll for the result instead of blocking
+                        # the whole request on however many Twilio calls are in the batch.
+                        task_id = data["taskId"]
+                        with st.spinner(f"Sending to {data['total']} recipient(s)..."):
+                            status_data = None
+                            for _ in range(60):
+                                try:
+                                    status_resp = requests.get(
+                                        f"{API_BASE_URL}/api/send/status/{task_id}",
+                                        headers=auth_headers(),
+                                        timeout=10,
+                                    )
+                                    status_data = status_resp.json()
+                                except requests.RequestException as err:
+                                    st.error(f"Request failed: {err}")
+                                    break
+                                if status_resp.status_code != 200:
+                                    st.error(status_data.get("detail", "Send failed"))
+                                    break
+                                if status_data.get("status") == "done":
+                                    break
+                                time.sleep(1)
+
+                        if status_data and status_data.get("status") == "done":
+                            st.success(f"Message sent to {status_data['sentCount']} recipient(s).")
+                            failed_count = status_data["total"] - status_data["sentCount"]
                             if failed_count:
                                 st.warning(f"{failed_count} message(s) failed to send.")
+                        elif status_data and status_data.get("status") != "done":
+                            st.warning("Still sending in the background — check back in a moment.")
 
 # ---------------------------------------------------------------------------
 # Manage Contacts tab

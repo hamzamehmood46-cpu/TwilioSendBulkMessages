@@ -2,21 +2,29 @@ import json
 import os
 import re
 import secrets
-import time
 from pathlib import Path
 from typing import List, Optional
 
 import pyotp
+import redis
+from celery.result import AsyncResult
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, field_validator
 from twilio.rest import Client
-from twilio.base.exceptions import TwilioRestException
+
+from celery_app import celery_app
+from tasks import send_sms_batch
 
 PHONE_RE = re.compile(r"^\+\d{8,15}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 TOTP_CODE_RE = re.compile(r"^\d{6}$")
 SESSION_DURATION_SECONDS = 15 * 60
+CONTACTS_CACHE_TTL_SECONDS = 10
+PHONE_NUMBERS_CACHE_TTL_SECONDS = 300
+SESSION_KEY_PREFIX = "session:"
+CONTACTS_CACHE_KEY = "contacts_cache"
+PHONE_NUMBERS_CACHE_KEY = "phone_numbers_cache"
 
 BASE_DIR = Path(__file__).parent
 CONTACTS_FILE = BASE_DIR / "contacts.json"
@@ -25,26 +33,23 @@ load_dotenv(BASE_DIR / "twilio.env")
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 TOTP_SECRET = os.getenv("TOTP_SECRET")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 app = FastAPI(title="Twilio Bulk SMS Demo")
 
-# In-memory session store: {token: expires_at_epoch_seconds}
-# A demo-grade session store. Restarting the backend invalidates all sessions.
-_sessions: dict[str, float] = {}
 
-
+# Sessions live in Redis (not an in-process dict) so that logins survive a
+# backend restart and work correctly across multiple uvicorn worker processes.
 def require_session(authorization: Optional[str] = Header(None)) -> None:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     token = authorization.removeprefix("Bearer ").strip()
-    expires_at = _sessions.get(token)
-    if expires_at is None or expires_at < time.time():
-        _sessions.pop(token, None)
+    if not redis_client.exists(SESSION_KEY_PREFIX + token):
         raise HTTPException(status_code=401, detail="Session expired, please log in again")
 
 
@@ -67,6 +72,7 @@ class Recipient(BaseModel):
 
 class SendRequest(BaseModel):
     message: str
+    fromNumber: str
     recipients: List[Recipient]
 
 
@@ -117,11 +123,18 @@ class BulkImportRequest(BaseModel):
 
 
 def _read_contacts():
-    return json.loads(CONTACTS_FILE.read_text())
+    cached = redis_client.get(CONTACTS_CACHE_KEY)
+    if cached is not None:
+        return json.loads(cached)
+
+    data = json.loads(CONTACTS_FILE.read_text())
+    redis_client.setex(CONTACTS_CACHE_KEY, CONTACTS_CACHE_TTL_SECONDS, json.dumps(data))
+    return data
 
 
 def _write_contacts(data):
     CONTACTS_FILE.write_text(json.dumps(data, indent=2))
+    redis_client.delete(CONTACTS_CACHE_KEY)
 
 
 @app.post("/api/auth/login")
@@ -134,20 +147,34 @@ def login(req: LoginRequest):
         raise HTTPException(status_code=401, detail="Invalid or expired authenticator code")
 
     token = secrets.token_urlsafe(32)
-    _sessions[token] = time.time() + SESSION_DURATION_SECONDS
+    redis_client.setex(SESSION_KEY_PREFIX + token, SESSION_DURATION_SECONDS, "valid")
     return {"token": token, "expiresInSeconds": SESSION_DURATION_SECONDS}
 
 
 @app.post("/api/auth/logout")
 def logout(authorization: Optional[str] = Header(None)):
     if authorization and authorization.startswith("Bearer "):
-        _sessions.pop(authorization.removeprefix("Bearer ").strip(), None)
+        redis_client.delete(SESSION_KEY_PREFIX + authorization.removeprefix("Bearer ").strip())
     return {"ok": True}
 
 
 @app.get("/api/contacts")
 def get_contacts():
     return _read_contacts()["groups"]
+
+
+@app.get("/api/phone-numbers")
+def get_phone_numbers():
+    cached = redis_client.get(PHONE_NUMBERS_CACHE_KEY)
+    if cached is not None:
+        return json.loads(cached)
+
+    numbers = [
+        {"friendlyName": n.friendly_name, "phoneNumber": n.phone_number}
+        for n in twilio_client.incoming_phone_numbers.list()
+    ]
+    redis_client.setex(PHONE_NUMBERS_CACHE_KEY, PHONE_NUMBERS_CACHE_TTL_SECONDS, json.dumps(numbers))
+    return numbers
 
 
 @app.post("/api/contacts", dependencies=[Depends(require_session)])
@@ -219,28 +246,25 @@ def send_messages(req: SendRequest):
         raise HTTPException(status_code=400, detail="Message is required")
     if not req.recipients:
         raise HTTPException(status_code=400, detail="At least one recipient is required")
+    if not PHONE_RE.match(req.fromNumber.strip()):
+        raise HTTPException(status_code=400, detail="A valid sender number is required")
 
-    results = []
-    for recipient in req.recipients:
-        try:
-            sms = client.messages.create(
-                body=req.message,
-                from_=TWILIO_PHONE_NUMBER,
-                to=recipient.phone,
-            )
-            results.append({
-                "name": recipient.name,
-                "phone": recipient.phone,
-                "status": "sent",
-                "sid": sms.sid,
-            })
-        except TwilioRestException as err:
-            results.append({
-                "name": recipient.name,
-                "phone": recipient.phone,
-                "status": "failed",
-                "error": str(err),
-            })
+    # Hand the actual Twilio calls off to a Celery worker instead of blocking
+    # this request for the whole batch — keeps the API responsive under load.
+    recipients = [r.model_dump() for r in req.recipients]
+    task = send_sms_batch.delay(req.message, req.fromNumber.strip(), recipients)
+    return {"taskId": task.id, "status": "queued", "total": len(recipients)}
 
-    sent_count = sum(1 for r in results if r["status"] == "sent")
-    return {"sentCount": sent_count, "total": len(results), "results": results}
+
+@app.get("/api/send/status/{task_id}", dependencies=[Depends(require_session)])
+def send_status(task_id: str):
+    result = AsyncResult(task_id, app=celery_app)
+
+    if result.state == "PENDING" or result.state == "STARTED":
+        return {"status": "pending"}
+    if result.state == "FAILURE":
+        raise HTTPException(status_code=500, detail=str(result.result))
+    if result.state == "SUCCESS":
+        payload = result.result
+        return {"status": "done", "sentCount": payload["sentCount"], "total": payload["total"]}
+    return {"status": result.state.lower()}

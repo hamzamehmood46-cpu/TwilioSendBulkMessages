@@ -8,3 +8,5 @@ pyotp
 qrcode[pil]
 pandas
 openpyxl
+redis<5
+celery
