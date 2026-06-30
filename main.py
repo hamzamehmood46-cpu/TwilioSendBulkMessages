@@ -14,6 +14,7 @@ from pydantic import BaseModel, field_validator
 from twilio.rest import Client
 
 from celery_app import celery_app
+from database import MessageLog, SessionLocal, init_db
 from tasks import send_sms_batch
 
 PHONE_RE = re.compile(r"^\+\d{8,15}$")
@@ -40,6 +41,7 @@ redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 app = FastAPI(title="Twilio Bulk SMS Demo")
+init_db()
 
 
 # Sessions live in Redis (not an in-process dict) so that logins survive a
@@ -268,3 +270,26 @@ def send_status(task_id: str):
         payload = result.result
         return {"status": "done", "sentCount": payload["sentCount"], "total": payload["total"]}
     return {"status": result.state.lower()}
+
+
+@app.get("/api/logs", dependencies=[Depends(require_session)])
+def get_logs(limit: int = 100):
+    session = SessionLocal()
+    try:
+        rows = session.query(MessageLog).order_by(MessageLog.sent_at.desc()).limit(min(limit, 500)).all()
+        return [
+            {
+                "id": r.id,
+                "sentAt": r.sent_at.isoformat(),
+                "fromNumber": r.from_number,
+                "toNumber": r.to_number,
+                "recipientName": r.recipient_name,
+                "message": r.message_body,
+                "status": r.status,
+                "twilioSid": r.twilio_sid,
+                "error": r.error,
+            }
+            for r in rows
+        ]
+    finally:
+        session.close()

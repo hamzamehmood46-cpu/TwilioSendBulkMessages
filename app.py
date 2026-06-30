@@ -322,7 +322,7 @@ if contacts_error:
     st.error(f"Could not reach the backend at {API_BASE_URL}: {contacts_error}")
     st.stop()
 
-tab_send, tab_contacts = st.tabs(["\U0001F4E4  Send Message", "\U0001F465  Manage Contacts"])
+tab_send, tab_contacts, tab_logs = st.tabs(["\U0001F4E4  Send Message", "\U0001F465  Manage Contacts", "\U0001F4CB  Message Logs"])
 
 # ---------------------------------------------------------------------------
 # Send Message tab
@@ -669,3 +669,61 @@ with tab_contacts:
                                     for e in data["errors"]:
                                         st.caption(f"Row {e['row']} ({e.get('name', '')}): {e['reason']}")
                                 st.rerun()
+
+# ---------------------------------------------------------------------------
+# Message Logs tab
+# ---------------------------------------------------------------------------
+with tab_logs:
+    col_log_header, col_log_refresh = st.columns([4, 1])
+    with col_log_header:
+        st.markdown("### Message Logs")
+    with col_log_refresh:
+        st.button("Refresh", key="refresh_logs", use_container_width=True)
+
+    limit = st.number_input("Show last N entries", min_value=10, max_value=500, value=100, step=10)
+
+    try:
+        logs_resp = requests.get(
+            f"{API_BASE_URL}/api/logs",
+            params={"limit": limit},
+            headers=auth_headers(),
+            timeout=10,
+        )
+        if handle_unauthorized(logs_resp):
+            st.error("Session expired. Please log in again.")
+        elif logs_resp.status_code != 200:
+            st.error(logs_resp.json().get("detail", "Could not fetch logs"))
+        else:
+            logs = logs_resp.json()
+            if not logs:
+                st.info("No messages logged yet.")
+            else:
+                sent_total = sum(1 for r in logs if r["status"] == "sent")
+                failed_total = len(logs) - sent_total
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Showing", len(logs))
+                m2.metric("Sent", sent_total)
+                m3.metric("Failed", failed_total)
+
+                st.divider()
+
+                for row in logs:
+                    status_class = "result-sent" if row["status"] == "sent" else "result-failed"
+                    status_label = row["status"].upper()
+                    ts = row["sentAt"].replace("T", " ")[:19]
+                    sid_text = f'SID: {row["twilioSid"]}' if row.get("twilioSid") else (row.get("error") or "")
+                    st.markdown(
+                        f"""
+                        <div class="result-row {status_class}">
+                            <span><strong>{row['recipientName']}</strong> &rarr; {row['toNumber']}</span>
+                            <span style="font-size:0.82rem;opacity:0.8">{ts}</span>
+                            <span><strong>{status_label}</strong></span>
+                        </div>
+                        <div style="font-size:0.78rem;color:#8a8f98;margin:-4px 0 10px 12px">
+                            From: {row['fromNumber']} &nbsp;|&nbsp; {sid_text}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+    except requests.RequestException as err:
+        st.error(f"Request failed: {err}")

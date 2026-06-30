@@ -10,3 +10,5 @@ pandas
 openpyxl
 redis<5
 celery
+sqlalchemy
+pyodbc

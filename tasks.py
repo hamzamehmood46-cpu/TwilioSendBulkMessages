@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 from celery_app import celery_app
+from database import log_message
 from dotenv import load_dotenv
 from twilio.base.exceptions import TwilioRestException
 from twilio.rest import Client
@@ -30,6 +31,7 @@ def send_sms_batch(message: str, from_number: str, recipients: list[dict]) -> di
                 "status": "sent",
                 "sid": sms.sid,
             })
+            log_message(from_number, recipient["phone"], recipient["name"], message, "sent", twilio_sid=sms.sid)
         except TwilioRestException as err:
             results.append({
                 "name": recipient["name"],
@@ -37,6 +39,7 @@ def send_sms_batch(message: str, from_number: str, recipients: list[dict]) -> di
                 "status": "failed",
                 "error": str(err),
             })
+            log_message(from_number, recipient["phone"], recipient["name"], message, "failed", error=str(err))
 
     sent_count = sum(1 for r in results if r["status"] == "sent")
     return {"sentCount": sent_count, "total": len(results), "results": results}
