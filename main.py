@@ -9,12 +9,12 @@ import pyotp
 import redis
 from celery.result import AsyncResult
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, field_validator
 from twilio.rest import Client
 
 from celery_app import celery_app
-from database import MessageLog, SessionLocal, init_db
+from database import LoginLog, MessageLog, SessionLocal, init_db, log_auth_event
 from tasks import send_sms_batch
 
 PHONE_RE = re.compile(r"^\+\d{8,15}$")
@@ -44,8 +44,6 @@ app = FastAPI(title="Twilio Bulk SMS Demo")
 init_db()
 
 
-# Sessions live in Redis (not an in-process dict) so that logins survive a
-# backend restart and work correctly across multiple uvicorn worker processes.
 def require_session(authorization: Optional[str] = Header(None)) -> None:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -53,6 +51,24 @@ def require_session(authorization: Optional[str] = Header(None)) -> None:
     token = authorization.removeprefix("Bearer ").strip()
     if not redis_client.exists(SESSION_KEY_PREFIX + token):
         raise HTTPException(status_code=401, detail="Session expired, please log in again")
+
+
+def _fetch_and_cache_phone_numbers() -> list[dict]:
+    """Fetch phone numbers from Twilio, populate the Redis cache, and return the list."""
+    numbers = [
+        {"friendlyName": n.friendly_name, "phoneNumber": n.phone_number}
+        for n in twilio_client.incoming_phone_numbers.list()
+    ]
+    redis_client.setex(PHONE_NUMBERS_CACHE_KEY, PHONE_NUMBERS_CACHE_TTL_SECONDS, json.dumps(numbers))
+    return numbers
+
+
+def _get_valid_sender_numbers() -> set[str]:
+    """Return the set of phone numbers owned by this Twilio account (uses cache)."""
+    cached = redis_client.get(PHONE_NUMBERS_CACHE_KEY)
+    if cached:
+        return {n["phoneNumber"] for n in json.loads(cached)}
+    return {n["phoneNumber"] for n in _fetch_and_cache_phone_numbers()}
 
 
 class LoginRequest(BaseModel):
@@ -140,23 +156,29 @@ def _write_contacts(data):
 
 
 @app.post("/api/auth/login")
-def login(req: LoginRequest):
+def login(req: LoginRequest, request: Request):
+    client_ip = request.client.host if request.client else None
+
     if not TOTP_SECRET:
         raise HTTPException(status_code=500, detail="TOTP_SECRET not configured. Run setup_totp.py first.")
 
     totp = pyotp.TOTP(TOTP_SECRET)
     if not totp.verify(req.code, valid_window=1):
+        log_auth_event("login_failed", ip_address=client_ip, details="Invalid TOTP code")
         raise HTTPException(status_code=401, detail="Invalid or expired authenticator code")
 
     token = secrets.token_urlsafe(32)
     redis_client.setex(SESSION_KEY_PREFIX + token, SESSION_DURATION_SECONDS, "valid")
+    log_auth_event("login_success", ip_address=client_ip)
     return {"token": token, "expiresInSeconds": SESSION_DURATION_SECONDS}
 
 
 @app.post("/api/auth/logout")
-def logout(authorization: Optional[str] = Header(None)):
+def logout(request: Request, authorization: Optional[str] = Header(None)):
+    client_ip = request.client.host if request.client else None
     if authorization and authorization.startswith("Bearer "):
         redis_client.delete(SESSION_KEY_PREFIX + authorization.removeprefix("Bearer ").strip())
+    log_auth_event("logout", ip_address=client_ip)
     return {"ok": True}
 
 
@@ -170,13 +192,7 @@ def get_phone_numbers():
     cached = redis_client.get(PHONE_NUMBERS_CACHE_KEY)
     if cached is not None:
         return json.loads(cached)
-
-    numbers = [
-        {"friendlyName": n.friendly_name, "phoneNumber": n.phone_number}
-        for n in twilio_client.incoming_phone_numbers.list()
-    ]
-    redis_client.setex(PHONE_NUMBERS_CACHE_KEY, PHONE_NUMBERS_CACHE_TTL_SECONDS, json.dumps(numbers))
-    return numbers
+    return _fetch_and_cache_phone_numbers()
 
 
 @app.post("/api/contacts", dependencies=[Depends(require_session)])
@@ -248,13 +264,21 @@ def send_messages(req: SendRequest):
         raise HTTPException(status_code=400, detail="Message is required")
     if not req.recipients:
         raise HTTPException(status_code=400, detail="At least one recipient is required")
-    if not PHONE_RE.match(req.fromNumber.strip()):
+
+    from_number = req.fromNumber.strip()
+    if not PHONE_RE.match(from_number):
         raise HTTPException(status_code=400, detail="A valid sender number is required")
 
-    # Hand the actual Twilio calls off to a Celery worker instead of blocking
-    # this request for the whole batch — keeps the API responsive under load.
+    # Verify the sender number is actually owned by this Twilio account.
+    valid_numbers = _get_valid_sender_numbers()
+    if valid_numbers and from_number not in valid_numbers:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Sender number {from_number} is not in your Twilio account",
+        )
+
     recipients = [r.model_dump() for r in req.recipients]
-    task = send_sms_batch.delay(req.message, req.fromNumber.strip(), recipients)
+    task = send_sms_batch.delay(req.message, from_number, recipients)
     return {"taskId": task.id, "status": "queued", "total": len(recipients)}
 
 
@@ -276,7 +300,12 @@ def send_status(task_id: str):
 def get_logs(limit: int = 100):
     session = SessionLocal()
     try:
-        rows = session.query(MessageLog).order_by(MessageLog.sent_at.desc()).limit(min(limit, 500)).all()
+        rows = (
+            session.query(MessageLog)
+            .order_by(MessageLog.sent_at.desc())
+            .limit(min(limit, 500))
+            .all()
+        )
         return [
             {
                 "id": r.id,
@@ -288,6 +317,30 @@ def get_logs(limit: int = 100):
                 "status": r.status,
                 "twilioSid": r.twilio_sid,
                 "error": r.error,
+            }
+            for r in rows
+        ]
+    finally:
+        session.close()
+
+
+@app.get("/api/logs/auth", dependencies=[Depends(require_session)])
+def get_auth_logs(limit: int = 100):
+    session = SessionLocal()
+    try:
+        rows = (
+            session.query(LoginLog)
+            .order_by(LoginLog.logged_at.desc())
+            .limit(min(limit, 500))
+            .all()
+        )
+        return [
+            {
+                "id": r.id,
+                "loggedAt": r.logged_at.isoformat(),
+                "action": r.action,
+                "ipAddress": r.ip_address,
+                "details": r.details,
             }
             for r in rows
         ]

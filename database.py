@@ -8,7 +8,15 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 load_dotenv(Path(__file__).parent / "twilio.env")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./message_logs.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not configured. "
+        "Set it in twilio.env to a SQL Server or PostgreSQL connection string. "
+        "Example (SQL Server / Windows Auth): "
+        "mssql+pyodbc://localhost/TwilioSmsConsole"
+        "?driver=ODBC+Driver+18+for+SQL+Server&trusted_connection=yes&TrustServerCertificate=yes"
+    )
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -29,6 +37,17 @@ class MessageLog(Base):
     error = Column(Text, nullable=True)
 
 
+class LoginLog(Base):
+    """Records every authentication event: successful logins, failed attempts, and logouts."""
+    __tablename__ = "login_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    logged_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    action = Column(String(30), nullable=False)   # login_success | login_failed | logout
+    ip_address = Column(String(45), nullable=True)
+    details = Column(Text, nullable=True)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 
@@ -45,6 +64,15 @@ def log_message(from_number, to_number, recipient_name, message_body, status, tw
             twilio_sid=twilio_sid,
             error=error,
         ))
+        session.commit()
+    finally:
+        session.close()
+
+
+def log_auth_event(action: str, ip_address: str = None, details: str = None):
+    session = SessionLocal()
+    try:
+        session.add(LoginLog(action=action, ip_address=ip_address, details=details))
         session.commit()
     finally:
         session.close()

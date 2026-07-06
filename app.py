@@ -586,23 +586,34 @@ with tab_contacts:
         bulk_v = st.session_state.bulk_import_version
 
         with st.container(border=True):
-            st.markdown("### Bulk Import (Excel)")
-            st.caption("Upload an .xlsx file with columns: Group, Name, Phone, Email (Email optional).")
+            st.markdown("### Bulk Import (Excel or CSV)")
+            st.caption("Upload an .xlsx or .csv file with columns: Group, Name, Phone, Email (Email optional).")
 
-            template_buffer = io.BytesIO()
-            pd.DataFrame([
-                {"Group": "IT Department", "Name": "Jane Doe", "Phone": "+15551234567", "Email": "jane@example.com"}
-            ]).to_excel(template_buffer, index=False)
-            st.download_button(
-                "Download template (.xlsx)",
-                data=template_buffer.getvalue(),
-                file_name="contacts_template.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+            dl_col1, dl_col2 = st.columns(2)
+            with dl_col1:
+                template_buffer = io.BytesIO()
+                pd.DataFrame([
+                    {"Group": "IT Department", "Name": "Jane Doe", "Phone": "+15551234567", "Email": "jane@example.com"}
+                ]).to_excel(template_buffer, index=False)
+                st.download_button(
+                    "Download template (.xlsx)",
+                    data=template_buffer.getvalue(),
+                    file_name="contacts_template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with dl_col2:
+                csv_template = "Group,Name,Phone,Email\nIT Department,Jane Doe,+15551234567,jane@example.com\n"
+                st.download_button(
+                    "Download template (.csv)",
+                    data=csv_template,
+                    file_name="contacts_template.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
             uploaded_file = st.file_uploader(
-                "Excel file", type=["xlsx"], key=f"bulk_upload_{bulk_v}", label_visibility="collapsed"
+                "Excel or CSV file", type=["xlsx", "csv"], key=f"bulk_upload_{bulk_v}", label_visibility="collapsed"
             )
             import_clicked = st.button(
                 "Import Contacts",
@@ -614,9 +625,12 @@ with tab_contacts:
 
         if import_clicked and uploaded_file is not None:
             try:
-                df = pd.read_excel(uploaded_file, dtype=str)
+                if uploaded_file.name.lower().endswith(".csv"):
+                    df = pd.read_csv(uploaded_file, dtype=str)
+                else:
+                    df = pd.read_excel(uploaded_file, dtype=str)
             except Exception as err:
-                st.error(f"Could not read the Excel file: {err}")
+                st.error(f"Could not read the file: {err}")
             else:
                 df.columns = [str(c).strip().lower() for c in df.columns]
                 missing = {"group", "name", "phone"} - set(df.columns)
@@ -674,56 +688,121 @@ with tab_contacts:
 # Message Logs tab
 # ---------------------------------------------------------------------------
 with tab_logs:
-    col_log_header, col_log_refresh = st.columns([4, 1])
-    with col_log_header:
-        st.markdown("### Message Logs")
-    with col_log_refresh:
-        st.button("Refresh", key="refresh_logs", use_container_width=True)
+    log_subtab_msg, log_subtab_auth = st.tabs(["SMS Logs", "Auth / Login Logs"])
 
-    limit = st.number_input("Show last N entries", min_value=10, max_value=500, value=100, step=10)
+    # ---- SMS Logs ----
+    with log_subtab_msg:
+        col_log_header, col_log_refresh = st.columns([4, 1])
+        with col_log_header:
+            st.markdown("### SMS Message Logs")
+        with col_log_refresh:
+            st.button("Refresh", key="refresh_logs", use_container_width=True)
 
-    try:
-        logs_resp = requests.get(
-            f"{API_BASE_URL}/api/logs",
-            params={"limit": limit},
-            headers=auth_headers(),
-            timeout=10,
-        )
-        if handle_unauthorized(logs_resp):
-            st.error("Session expired. Please log in again.")
-        elif logs_resp.status_code != 200:
-            st.error(logs_resp.json().get("detail", "Could not fetch logs"))
-        else:
-            logs = logs_resp.json()
-            if not logs:
-                st.info("No messages logged yet.")
+        sms_limit = st.number_input("Show last N entries", min_value=10, max_value=500, value=100, step=10, key="sms_limit")
+
+        try:
+            logs_resp = requests.get(
+                f"{API_BASE_URL}/api/logs",
+                params={"limit": sms_limit},
+                headers=auth_headers(),
+                timeout=10,
+            )
+            if handle_unauthorized(logs_resp):
+                st.error("Session expired. Please log in again.")
+            elif logs_resp.status_code != 200:
+                st.error(logs_resp.json().get("detail", "Could not fetch logs"))
             else:
-                sent_total = sum(1 for r in logs if r["status"] == "sent")
-                failed_total = len(logs) - sent_total
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Showing", len(logs))
-                m2.metric("Sent", sent_total)
-                m3.metric("Failed", failed_total)
+                logs = logs_resp.json()
+                if not logs:
+                    st.info("No messages logged yet.")
+                else:
+                    sent_total = sum(1 for r in logs if r["status"] == "sent")
+                    failed_total = len(logs) - sent_total
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Showing", len(logs))
+                    m2.metric("Sent", sent_total)
+                    m3.metric("Failed", failed_total)
 
-                st.divider()
+                    st.divider()
 
-                for row in logs:
-                    status_class = "result-sent" if row["status"] == "sent" else "result-failed"
-                    status_label = row["status"].upper()
-                    ts = row["sentAt"].replace("T", " ")[:19]
-                    sid_text = f'SID: {row["twilioSid"]}' if row.get("twilioSid") else (row.get("error") or "")
-                    st.markdown(
-                        f"""
-                        <div class="result-row {status_class}">
-                            <span><strong>{row['recipientName']}</strong> &rarr; {row['toNumber']}</span>
-                            <span style="font-size:0.82rem;opacity:0.8">{ts}</span>
-                            <span><strong>{status_label}</strong></span>
-                        </div>
-                        <div style="font-size:0.78rem;color:#8a8f98;margin:-4px 0 10px 12px">
-                            From: {row['fromNumber']} &nbsp;|&nbsp; {sid_text}
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-    except requests.RequestException as err:
-        st.error(f"Request failed: {err}")
+                    for row in logs:
+                        status_class = "result-sent" if row["status"] == "sent" else "result-failed"
+                        status_label = row["status"].upper()
+                        ts = row["sentAt"].replace("T", " ")[:19]
+                        sid_text = f'SID: {row["twilioSid"]}' if row.get("twilioSid") else (row.get("error") or "")
+                        st.markdown(
+                            f"""
+                            <div class="result-row {status_class}">
+                                <span><strong>{row['recipientName']}</strong> &rarr; {row['toNumber']}</span>
+                                <span style="font-size:0.82rem;opacity:0.8">{ts}</span>
+                                <span><strong>{status_label}</strong></span>
+                            </div>
+                            <div style="font-size:0.78rem;color:#8a8f98;margin:-4px 0 10px 12px">
+                                From: {row['fromNumber']} &nbsp;|&nbsp; {sid_text}
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+        except requests.RequestException as err:
+            st.error(f"Request failed: {err}")
+
+    # ---- Auth / Login Logs ----
+    with log_subtab_auth:
+        col_auth_header, col_auth_refresh = st.columns([4, 1])
+        with col_auth_header:
+            st.markdown("### Authentication Logs")
+        with col_auth_refresh:
+            st.button("Refresh", key="refresh_auth_logs", use_container_width=True)
+
+        auth_limit = st.number_input("Show last N entries", min_value=10, max_value=500, value=100, step=10, key="auth_limit")
+
+        _ACTION_STYLE = {
+            "login_success": ("result-sent", "LOGIN SUCCESS"),
+            "login_failed": ("result-failed", "LOGIN FAILED"),
+            "logout": ("", "LOGOUT"),
+        }
+
+        try:
+            auth_resp = requests.get(
+                f"{API_BASE_URL}/api/logs/auth",
+                params={"limit": auth_limit},
+                headers=auth_headers(),
+                timeout=10,
+            )
+            if handle_unauthorized(auth_resp):
+                st.error("Session expired. Please log in again.")
+            elif auth_resp.status_code != 200:
+                st.error(auth_resp.json().get("detail", "Could not fetch auth logs"))
+            else:
+                auth_logs = auth_resp.json()
+                if not auth_logs:
+                    st.info("No authentication events logged yet.")
+                else:
+                    success_count = sum(1 for r in auth_logs if r["action"] == "login_success")
+                    failed_count = sum(1 for r in auth_logs if r["action"] == "login_failed")
+                    logout_count = sum(1 for r in auth_logs if r["action"] == "logout")
+                    a1, a2, a3 = st.columns(3)
+                    a1.metric("Logins", success_count)
+                    a2.metric("Failed Attempts", failed_count)
+                    a3.metric("Logouts", logout_count)
+
+                    st.divider()
+
+                    for row in auth_logs:
+                        css_class, label = _ACTION_STYLE.get(row["action"], ("", row["action"].upper()))
+                        ts = row["loggedAt"].replace("T", " ")[:19]
+                        ip_text = row.get("ipAddress") or "—"
+                        detail_text = row.get("details") or ""
+                        st.markdown(
+                            f"""
+                            <div class="result-row {css_class}">
+                                <span><strong>{label}</strong></span>
+                                <span style="font-size:0.82rem;opacity:0.8">{ts}</span>
+                                <span>IP: {ip_text}</span>
+                            </div>
+                            {"" if not detail_text else f'<div style="font-size:0.78rem;color:#8a8f98;margin:-4px 0 10px 12px">{detail_text}</div>'}
+                            """,
+                            unsafe_allow_html=True,
+                        )
+        except requests.RequestException as err:
+            st.error(f"Request failed: {err}")
