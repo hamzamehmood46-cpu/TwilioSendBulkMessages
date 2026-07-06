@@ -728,17 +728,24 @@ with tab_logs:
                     for row in logs:
                         status_class = "result-sent" if row["status"] == "sent" else "result-failed"
                         status_label = row["status"].upper()
-                        ts = row["sentAt"].replace("T", " ")[:19]
+                        sent_ts = row.get("sentAt") or "—"
+                        created_ts = row.get("createdAt") or "—"
+                        updated_ts = row.get("updatedAt") or "—"
                         sid_text = f'SID: {row["twilioSid"]}' if row.get("twilioSid") else (row.get("error") or "")
+                        sent_by = row.get("sentBy") or "—"
                         st.markdown(
                             f"""
                             <div class="result-row {status_class}">
                                 <span><strong>{row['recipientName']}</strong> &rarr; {row['toNumber']}</span>
-                                <span style="font-size:0.82rem;opacity:0.8">{ts}</span>
+                                <span style="font-size:0.82rem;opacity:0.8">{sent_ts}</span>
                                 <span><strong>{status_label}</strong></span>
                             </div>
                             <div style="font-size:0.78rem;color:#8a8f98;margin:-4px 0 10px 12px">
-                                From: {row['fromNumber']} &nbsp;|&nbsp; {sid_text}
+                                From: {row['fromNumber']} &nbsp;|&nbsp;
+                                Sent by: <strong>{sent_by}</strong> &nbsp;|&nbsp;
+                                Created: {created_ts} &nbsp;|&nbsp;
+                                Updated: {updated_ts}
+                                {"" if not sid_text else f"&nbsp;|&nbsp; {sid_text}"}
                             </div>
                             """,
                             unsafe_allow_html=True,

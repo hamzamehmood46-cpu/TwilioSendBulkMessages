@@ -14,7 +14,12 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 
 @celery_app.task(name="tasks.send_sms_batch")
-def send_sms_batch(message: str, from_number: str, recipients: list[dict]) -> dict:
+def send_sms_batch(
+    message: str,
+    from_number: str,
+    recipients: list[dict],
+    sent_by: str = "system",
+) -> dict:
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
     results = []
@@ -31,7 +36,10 @@ def send_sms_batch(message: str, from_number: str, recipients: list[dict]) -> di
                 "status": "sent",
                 "sid": sms.sid,
             })
-            log_message(from_number, recipient["phone"], recipient["name"], message, "sent", twilio_sid=sms.sid)
+            log_message(
+                from_number, recipient["phone"], recipient["name"],
+                message, "sent", twilio_sid=sms.sid, sent_by=sent_by,
+            )
         except TwilioRestException as err:
             results.append({
                 "name": recipient["name"],
@@ -39,7 +47,10 @@ def send_sms_batch(message: str, from_number: str, recipients: list[dict]) -> di
                 "status": "failed",
                 "error": str(err),
             })
-            log_message(from_number, recipient["phone"], recipient["name"], message, "failed", error=str(err))
+            log_message(
+                from_number, recipient["phone"], recipient["name"],
+                message, "failed", error=str(err), sent_by=sent_by,
+            )
 
     sent_count = sum(1 for r in results if r["status"] == "sent")
     return {"sentCount": sent_count, "total": len(results), "results": results}

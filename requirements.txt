@@ -12,3 +12,4 @@ redis<5
 celery
 sqlalchemy
 pyodbc
+tzdata
