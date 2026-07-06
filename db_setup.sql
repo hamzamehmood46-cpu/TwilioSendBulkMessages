@@ -36,17 +36,17 @@ IF NOT EXISTS (
 BEGIN
     CREATE TABLE message_logs (
         id             INT           NOT NULL IDENTITY(1,1) PRIMARY KEY,
-        sent_by        NVARCHAR(100)     NULL,               -- username who triggered the send
+        sent_by        NVARCHAR(100)     NULL,               -- username (plaintext — not PII)
         sent_at        DATETIME      NOT NULL DEFAULT GETUTCDATE(),
         created_at     DATETIME      NOT NULL DEFAULT GETUTCDATE(),
         updated_at     DATETIME      NOT NULL DEFAULT GETUTCDATE(),
-        from_number    VARCHAR(20)   NOT NULL,               -- Twilio sender number (E.164)
-        to_number      VARCHAR(20)   NOT NULL,               -- recipient number  (E.164)
-        recipient_name VARCHAR(255)  NOT NULL,
-        message_body   VARCHAR(MAX)  NOT NULL,
-        status         VARCHAR(20)   NOT NULL,               -- 'sent' | 'failed'
-        twilio_sid     VARCHAR(64)       NULL,               -- Twilio message SID (SMxxxxxxx)
-        error          VARCHAR(MAX)      NULL                -- error text when status = 'failed'
+        from_number    VARCHAR(500)  NOT NULL,               -- ENCRYPTED Twilio sender (E.164)
+        to_number      VARCHAR(500)  NOT NULL,               -- ENCRYPTED recipient    (E.164)
+        recipient_name VARCHAR(500)  NOT NULL,               -- ENCRYPTED display name
+        message_body   VARCHAR(MAX)  NOT NULL,               -- ENCRYPTED SMS text
+        status         VARCHAR(20)   NOT NULL,               -- plaintext: 'sent' | 'failed'
+        twilio_sid     VARCHAR(64)       NULL,               -- plaintext Twilio SID (SMxxxxxxx)
+        error          VARCHAR(MAX)      NULL                -- ENCRYPTED error text
     );
     PRINT 'Table message_logs created.';
 END
@@ -67,8 +67,8 @@ BEGIN
         id          INT          NOT NULL IDENTITY(1,1) PRIMARY KEY,
         logged_at   DATETIME     NOT NULL DEFAULT GETUTCDATE(),
         action      VARCHAR(30)  NOT NULL,   -- 'login_success' | 'login_failed' | 'logout'
-        ip_address  VARCHAR(45)      NULL,   -- IPv4 or IPv6 of the caller
-        details     VARCHAR(MAX)     NULL    -- extra context (e.g. 'user=Hamza')
+        ip_address  VARCHAR(500)     NULL,   -- ENCRYPTED IPv4 or IPv6 of the caller
+        details     VARCHAR(MAX)     NULL    -- ENCRYPTED extra context (e.g. 'user=Hamza')
     );
     PRINT 'Table login_logs created.';
 END

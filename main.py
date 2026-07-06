@@ -17,6 +17,7 @@ from twilio.rest import Client
 
 from celery_app import celery_app
 from database import LoginLog, MessageLog, SessionLocal, init_db, log_auth_event
+from encryption import decrypt, encrypt
 from tasks import send_sms_batch
 
 PHONE_RE = re.compile(r"^\+\d{8,15}$")
@@ -165,17 +166,55 @@ class BulkImportRequest(BaseModel):
     contacts: List[BulkContactRow]
 
 
+def _decrypt_contacts(raw: dict) -> dict:
+    """Return a copy of contacts with phone and email decrypted."""
+    return {
+        "groups": {
+            group: [
+                {
+                    "name":  c["name"],
+                    "phone": decrypt(c["phone"]),
+                    "email": decrypt(c.get("email", "")) or "",
+                }
+                for c in contacts
+            ]
+            for group, contacts in raw["groups"].items()
+        }
+    }
+
+
+def _encrypt_contacts(data: dict) -> dict:
+    """Return a copy of contacts with phone and email encrypted for storage."""
+    return {
+        "groups": {
+            group: [
+                {
+                    "name":  c["name"],
+                    "phone": encrypt(c["phone"]),
+                    "email": encrypt(c["email"]) if c.get("email") else "",
+                }
+                for c in contacts
+            ]
+            for group, contacts in data["groups"].items()
+        }
+    }
+
+
 def _read_contacts():
+    """Read contacts from cache/file (stored encrypted) and return decrypted."""
     cached = redis_client.get(CONTACTS_CACHE_KEY)
     if cached is not None:
-        return json.loads(cached)
-    data = json.loads(CONTACTS_FILE.read_text())
-    redis_client.setex(CONTACTS_CACHE_KEY, CONTACTS_CACHE_TTL_SECONDS, json.dumps(data))
-    return data
+        raw = json.loads(cached)
+    else:
+        raw = json.loads(CONTACTS_FILE.read_text())
+        redis_client.setex(CONTACTS_CACHE_KEY, CONTACTS_CACHE_TTL_SECONDS, json.dumps(raw))
+    return _decrypt_contacts(raw)
 
 
 def _write_contacts(data):
-    CONTACTS_FILE.write_text(json.dumps(data, indent=2))
+    """Encrypt contacts then write to disk and invalidate cache."""
+    encrypted = _encrypt_contacts(data)
+    CONTACTS_FILE.write_text(json.dumps(encrypted, indent=2))
     redis_client.delete(CONTACTS_CACHE_KEY)
 
 
@@ -341,13 +380,13 @@ def get_logs(limit: int = 100):
                 "sentAt": _to_eastern(r.sent_at),
                 "createdAt": _to_eastern(r.created_at),
                 "updatedAt": _to_eastern(r.updated_at),
-                "fromNumber": r.from_number,
-                "toNumber": r.to_number,
-                "recipientName": r.recipient_name,
-                "message": r.message_body,
+                "fromNumber": decrypt(r.from_number),
+                "toNumber": decrypt(r.to_number),
+                "recipientName": decrypt(r.recipient_name),
+                "message": decrypt(r.message_body),
                 "status": r.status,
                 "twilioSid": r.twilio_sid,
-                "error": r.error,
+                "error": decrypt(r.error) if r.error else None,
             }
             for r in rows
         ]
@@ -370,8 +409,8 @@ def get_auth_logs(limit: int = 100):
                 "id": r.id,
                 "loggedAt": _to_eastern(r.logged_at),
                 "action": r.action,
-                "ipAddress": r.ip_address,
-                "details": r.details,
+                "ipAddress": decrypt(r.ip_address) if r.ip_address else None,
+                "details": decrypt(r.details) if r.details else None,
             }
             for r in rows
         ]

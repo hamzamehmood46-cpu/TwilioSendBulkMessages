@@ -13,3 +13,4 @@ celery
 sqlalchemy
 pyodbc
 tzdata
+cryptography
